@@ -1,0 +1,199 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{url}
+
+\begin{document}
+
+\title{3D Object Reconstruction Using Infrared Images Under Occlusion}
+
+\author{\IEEEauthorblockN{Joseff Ribble}
+\IEEEauthorblockA{Department of Electrical and Computer Engineering\\
+Email: joseffribble@proton.me}}
+
+\maketitle
+
+\begin{abstract}
+Reconstructing accurate three-dimensional (3D) geometry from infrared (IR) imagery enables perception through darkness, smoke, and visually degraded environments where conventional RGB sensors fail. However, practical IR 3D reconstruction faces two major challenges: (1) distinct radiometric physics---including Stefan-Boltzmann thermal emission, grazing-angle directional emissivity drop-off, atmospheric attenuation, and conductive heat diffusion---and (2) severe foreground occlusions from ambient-temperature obstacles or cast shadows. In this project report, we present a unified synthetic benchmark and algorithmic framework evaluating four complementary IR 3D reconstruction paradigms across passive Long-Wave Infrared (LWIR) multi-view thermal imaging and active Near-Infrared (NIR) photometric stereo. Specifically, we compare strict Visual Hull space carving against occlusion-voting space carving, Airborne Optical Sectioning (AOS) synthetic-aperture focal stacking, a physics-informed robust thermal radiance field incorporating Geman-McClure distractor gating and a 3D Fourier heat-conduction prior, and Iteratively Reweighted Least Squares (IRLS) NIR photometric stereo. Experimental results show that while classical strict space carving collapses completely under a 37.6\% pixel occlusion rate (0.000 IoU), AOS focal stacking and physics-informed robust thermal optimization preserve volumetric IoUs of 0.793 and 0.787, respectively. In active NIR photometric stereo under cast-shadow occlusions, robust IRLS reduces surface normal angular error from $8.21^\circ$ to $0.60^\circ$ and height mean absolute error by 70.3\%.
+\end{abstract}
+
+\begin{IEEEkeywords}
+3D reconstruction, infrared imaging, thermal radiance fields, airborne optical sectioning, photometric stereo, occlusion handling
+\end{IEEEkeywords}
+
+\section{Introduction}
+\IEEEPARstart{T}{hree-dimensional} object reconstruction from multi-view or multi-illumination images is a foundational problem in computer vision. While most classical and neural reconstruction pipelines rely on visible-spectrum (RGB) cameras \cite{mildenhall2020nerf,wang2021neus,kerbl2023gaussians,wang2024dust3r}, RGB sensors degrade rapidly under low-light conditions, smoke, fog, or strong surface texture variations. Infrared (IR) sensing overcomes many of these limitations across two complementary spectral regimes:
+\begin{enumerate}
+    \item \emph{Passive Long-Wave Infrared (LWIR, 8--14\,$\mu$m):} Thermal cameras measure self-emitted heat radiation without external illumination, making them well suited for search and rescue, industrial inspection, and nighttime robotics.
+    \item \emph{Active Near-Infrared (NIR, 750--1000\,nm):} Controlled NIR LED illumination penetrates shallow surface pigmentation to yield nearly uniform subsurface albedo while remaining unobtrusive to human observers \cite{hansen2010nir}.
+\end{enumerate}
+
+Despite these advantages, reconstructing 3D geometry from IR imagery introduces substantial algorithmic hurdles. Passive thermal images exhibit low spatial contrast, thermal diffusion blur, atmospheric path attenuation, and view-dependent directional emissivity falloff near grazing angles. Even more critically, real-world deployments frequently encounter heavy foreground occlusions---such as cold foliage, structural pillars, or cast shadows---that block lines of sight between the sensor and the heated target. Standard silhouette carving and least-squares photometric methods treat every occluded ray as empty space or valid shading, carving away true object geometry or severely biasing surface normals.
+
+In this work, we develop a reproducible Python simulation and benchmarking framework (\texttt{ir\_reconstruction}) to systematically evaluate occlusion-resilient 3D reconstruction using infrared images. Our main contributions are:
+\begin{itemize}
+    \item A physically grounded synthetic IR generator modeling Signed Distance Function (SDF) 3D geometry, Stefan-Boltzmann $T^4$ emission, grazing-angle directional emissivity, Beer-Lambert atmospheric attenuation, and configurable cylindrical foreground occluders, alongside an active NIR photometric stereo generator with cast-shadow corruptions.
+    \item Implementation and comparison of four reconstruction methods: (1) Occlusion-Aware Thermal Space Carving, (2) Airborne Optical Sectioning (AOS) synthetic-aperture focal stacking \cite{schedl2020search}, (3) a Physics-Informed Robust Thermal Radiance Field synthesizing ideas from Thermal-NeRF \cite{ye2024thermalnerf}, Thermal3D-GS \cite{chen2024thermal3dgs}, and RobustNeRF \cite{sabour2023robustnerf}, and (4) Robust IRLS NIR Photometric Stereo with Frankot-Chellappa Fourier integration.
+    \item Quantitative evaluation across Volumetric Intersection-over-Union (IoU), Symmetric $L_1$ Chamfer Distance, 3D F-Score, Height Mean Absolute Error (MAE), and Surface Normal Angular Error.
+\end{itemize}
+
+\section{Related Work}
+
+\subsection{Thermal Radiance Fields and 3D Gaussian Splatting}
+Neural Radiance Fields (NeRF) \cite{mildenhall2020nerf}, neural implicit surfaces such as NeuS \cite{wang2021neus}, and 3D Gaussian Splatting (3DGS) \cite{kerbl2023gaussians} have revolutionized multi-view 3D reconstruction. Recently, several works have adapted these representations to thermal infrared sensors. Thermal-NeRF \cite{ye2024thermalnerf} and ThermalNeRF \cite{lin2024thermalnerf} formulate volumetric rendering directly from uncooled infrared cameras by modeling thermal emission and sensor non-uniformity. ThermoNeRF \cite{hassan2025thermonerf} and X-NeRF \cite{zhu2023xnerf} fuse multimodal RGB and thermal views to overcome textureless thermal regions. In explicit point-based rendering, Thermal3D-GS \cite{chen2024thermal3dgs} and ThermalGaussian \cite{lu2024thermalgaussian} incorporate physics-induced constraints---specifically atmospheric transmission modeling and heat conduction equations---into 3D Gaussian primitives.
+
+\subsection{3D Reconstruction Under Occlusion and Distractors}
+When foreground obstacles partially occlude a target across views, standard photometric losses fail. In aerial thermal imaging through dense forest canopy, Schedl et al. \cite{schedl2020search} introduced Airborne Optical Sectioning (AOS), demonstrating that integrating multi-view thermal images over a synthetic aperture focuses on targets at a chosen depth plane while defocusing foreground occluders. In neural rendering, RobustNeRF \cite{sabour2023robustnerf} replaces standard $L_2$ photometric supervision with iteratively reweighted robust kernels to ignore transient distractors and occluders, while Amodal3R \cite{wu2025amodal3r} reconstructs occluded 3D geometry using amodal completion priors.
+
+\subsection{Active Near-Infrared Photometric Stereo}
+For fine-scale surface reconstruction at close range, Hansen et al. \cite{hansen2010nir} demonstrated that active NIR photometric stereo achieves high-fidelity 3D surface normal recovery because near-infrared illumination minimizes chromatic albedo variations. However, cast shadows and light-source occlusions violate the Lambertian model, motivating robust M-estimation techniques.
+
+\section{Physical Image Formation and Synthetic Testbed}
+
+\subsection{Passive Multi-View LWIR Thermal Scene Model}
+We define a composite 3D heated object inside $[-1, 1]^3$ using the exact union of three primitive Signed Distance Functions (SDFs): a central sphere of radius $r_s = 0.42$, an equatorial flange torus with major radius $R_t = 0.45$ and minor radius $r_t = 0.13$, and a vertical cylindrical stem of radius $r_c = 0.22$ and half-height $h_c = 0.55$:
+\begin{equation}
+    d_{\text{obj}}(\mathbf{x}) = \min\!\big(d_{\text{sphere}}(\mathbf{x}),\, d_{\text{torus}}(\mathbf{x}),\, d_{\text{cyl}}(\mathbf{x})\big),
+\end{equation}
+where points $\mathbf{x} = (x, y, z)^\top$ with $d_{\text{obj}}(\mathbf{x}) \le 0$ lie inside the object. To simulate steady-state conductive heat distribution from a core heat source ($T_{\text{obj}} = 345.0\,\text{K}$) in an ambient environment ($T_{\text{amb}} = 293.15\,\text{K}$), the spatial temperature field $T(\mathbf{x})$ is modeled as
+\begin{equation}
+\begin{aligned}
+    T(\mathbf{x}) = T_{\text{amb}} + \operatorname{clip}\!\Big(&\Delta T \big(1 - 0.25(x^2 + y^2) \\
+    &+ 0.15\sin(3z)\big),\, 10,\, 80\Big),
+\end{aligned}
+\end{equation}
+where $\Delta T = T_{\text{obj}} - T_{\text{amb}}$.
+
+For a calibrated turntable array of $V = 18$ pinhole cameras ($64 \times 64$ pixels, radius $2.4$, elevation $25^\circ \pm 10^\circ$), each camera ray $\mathbf{r}(t) = \mathbf{o} + t\mathbf{d}$ is marched across $S = 84$ samples in $t \in [1.0, 3.8]$. When a ray hits an unoccluded object surface point $\mathbf{x}^*$ at distance $d^* = t^*$ with unit outward normal $\mathbf{n}$ (computed via central finite differences of $d_{\text{obj}}$), the observed normalized LWIR intensity $I_{\text{LWIR}} \in [0, 1]$ combines three physical factors:
+\begin{equation}
+    I_{\text{LWIR}}(\mathbf{r}) = \varepsilon(\theta)\, \Phi(T(\mathbf{x}^*))\, \tau(d^*) + \eta,
+    \label{eq:lwir_model}
+\end{equation}
+where:
+\begin{itemize}
+    \item $\Phi(T) = \operatorname{clip}\!\left(\frac{T^4 - T_{\text{min}}^4}{T_{\text{max}}^4 - T_{\text{min}}^4}, 0, 1\right)$ is the normalized Stefan-Boltzmann radiant exitance;
+    \item $\varepsilon(\theta) = 0.92\big(1 - 0.25(1 - \cos\theta)^3\big)$ models directional emissivity drop-off at grazing incidence angles $\cos\theta = \max(-\mathbf{n}^\top \mathbf{d}, 0)$;
+    \item $\tau(d^*) = \exp(-\beta d^*)$ is Beer-Lambert atmospheric transmittance with attenuation coefficient $\beta = 0.05$; and
+    \item $\eta \sim \mathcal{N}(0, \sigma_{\text{LWIR}}^2)$ is additive sensor noise ($\sigma_{\text{LWIR}} = 0.01$).
+\end{itemize}
+To evaluate occlusion robustness, $N_{\text{occ}} = 6$ cold vertical cylindrical pillars ($r \in [0.10, 0.16]$, height $[-0.9, 0.9]$) are placed on a surrounding shell of radius $1.1$. Rays intercepted by an occluder before reaching the target record a near-ambient thermal signature ($I_{\text{occ}} \approx 0.04$).
+
+\subsection{Active NIR Photometric Stereo Scene Model}
+For active close-range reconstruction, we synthesize a smooth 3D dome with double-peak modulation $Z_{\text{gt}}(x, y)$ over a circular domain $x^2 + y^2 < 0.56$ on a $64 \times 64$ grid:
+\begin{equation}
+    Z_{\text{gt}}(x, y) = 0.38\sqrt{0.56 - (x^2 + y^2)} + 0.08\cos(4x)\cos(4y).
+\end{equation}
+The surface is illuminated sequentially by $L = 8$ calibrated directional NIR LEDs arranged in a ring at a $42^\circ$ slant angle with unit light vectors $\mathbf{s}_k \in \mathbb{R}^3$. Given uniform NIR subsurface albedo $\rho = 0.88$ and ground-truth unit normal $\mathbf{n}(x, y)$, the uncorrupted intensity is $I_k(x, y) = \rho \max(\mathbf{n}^\top \mathbf{s}_k, 0) + \eta_{\text{NIR}}$. For every third light source ($k \bmod 3 = 0$), an occluding bar casts a directional shadow band across the surface where intensity drops to $0.01$.
+
+\section{Reconstruction Methodology}
+
+\subsection{Occlusion-Aware Thermal Space Carving}
+Given a 3D evaluation grid of $R^3$ voxels within $[-0.8, 0.8]^3$, each voxel center $\mathbf{x}$ is projected into camera $i \in \{1, \dots, V\}$ to obtain image coordinates $(u_i, v_i)$ and bilinearly sampled thermal intensity $I_i(\mathbf{x})$. Let $\mathcal{V}(\mathbf{x})$ denote the set of cameras for which $\mathbf{x}$ projects inside the image bounds in front of the camera. We compute the multi-view thermal silhouette consistency ratio:
+\begin{equation}
+    \psi(\mathbf{x}) = \frac{1}{|\mathcal{V}(\mathbf{x})|} \sum_{i \in \mathcal{V}(\mathbf{x})} \mathbb{I}\!\left[I_i(\mathbf{x}) \ge \tau_{\text{hot}}\right],
+\end{equation}
+where $\tau_{\text{hot}} = 0.15$. Classical strict Visual Hull space carving requires $\psi(\mathbf{x}) \ge 0.98$, meaning a single cold occluder along any viewing ray carves the voxel away. Our occlusion-voting variant relaxes the consensus threshold to $\psi(\mathbf{x}) \ge \gamma_{\text{vote}} = 0.65$, preserving voxels that are consistently hot across unoccluded views.
+
+\subsection{Airborne Optical Sectioning (AOS) Focal Stack}
+Adapting AOS \cite{schedl2020search} to volumetric 3D reconstruction, we first compensate each back-projected ray sample for atmospheric distance loss via $\tilde{I}_i(\mathbf{x}) = I_i(\mathbf{x}) \exp(\beta z_i(\mathbf{x}))$. Because foreground cold occluders produce downward intensity outliers in a subset of views, we sort $\{\tilde{I}_i(\mathbf{x})\}_{i=1}^V$ in ascending order and discard the lowest $\alpha = 0.30$ fraction of views. Over the remaining $V - \lfloor \alpha V \rfloor$ unoccluded aperture views, we compute the trimmed mean $\mu_{\text{trim}}(\mathbf{x})$ and standard deviation $\sigma_{\text{trim}}(\mathbf{x})$, defining a radiometric coherence score:
+\begin{equation}
+    C_{\text{AOS}}(\mathbf{x}) = \mu_{\text{trim}}(\mathbf{x}) \exp\!\big(-3.5\,\sigma_{\text{trim}}(\mathbf{x})\big).
+\end{equation}
+True object surfaces exhibit high trimmed mean and low inter-view variance across unoccluded rays, whereas off-surface voxels defocus and are rejected.
+
+\subsection{Physics-Informed Robust Thermal Radiance Field}
+To jointly model thermal physics and reject occluders without hard view trimming, we optimize a volumetric thermal field $F(\mathbf{x}) \in [0, 1]$ over $K = 35$ gradient descent iterations. First, a conservative visual-hull prior $\mathcal{H}(\mathbf{x})$ carves free space where more than 12\% of rays observe pure background ($I_i(\mathbf{x}) < 0.022$), and $F^{(0)}(\mathbf{x})$ is initialized inside $\mathcal{H}$ using the 75th-percentile attenuation-compensated intensity $q_{75}(\mathbf{x})$.
+
+At each iteration $t$, the forward model predicts $\hat{I}_i(\mathbf{x}) = F^{(t)}(\mathbf{x}) \tau(z_i(\mathbf{x}))$ with residual $r_i(\mathbf{x}) = \hat{I}_i(\mathbf{x}) - I_i(\mathbf{x})$. Following RobustNeRF \cite{sabour2023robustnerf}, we weight each view using a Geman-McClure kernel modulated by a distractor gate:
+\begin{equation}
+    w_i(\mathbf{x}) = \frac{\kappa_i(\mathbf{x})}{\left(1 + \left(r_i(\mathbf{x}) / \delta\right)^2\right)^2},
+\end{equation}
+where $\delta = 0.06$, and $\kappa_i(\mathbf{x}) = 0.01$ if ray $i$ observes a cold occluder ($0.022 \le I_i(\mathbf{x}) < 0.15$) while the upper-quartile multi-view consensus is hot ($q_{75}(\mathbf{x}) > 0.25$). Furthermore, inspired by steady-state Fourier heat conduction ($\nabla^2 T = 0$) in Thermal3D-GS \cite{chen2024thermal3dgs}, we regularize $F(\mathbf{x})$ with a 3D discrete 6-neighbor Laplacian $\Delta_{\text{3D}} F(\mathbf{x})$:
+\begin{equation}
+\begin{aligned}
+    F^{(t+1)}(\mathbf{x}) = \Pi_{\mathcal{H}}\!\Bigg(&F^{(t)}(\mathbf{x}) - \eta_{\text{lr}} \bigg[ \frac{\sum_i w_i r_i \tau_i}{\sum_i w_i + \epsilon} \\
+    &- \lambda_{\text{cond}} \Delta_{\text{3D}} F^{(t)}(\mathbf{x}) \bigg]\Bigg),
+\end{aligned}
+\end{equation}
+with learning rate $\eta_{\text{lr}} = 0.40$ and conduction weight $\lambda_{\text{cond}} = 0.03$.
+
+\subsection{Robust NIR Photometric Stereo via IRLS}
+At each pixel in the active NIR dataset, we solve for the scaled normal $\mathbf{g} = \rho\mathbf{n} \in \mathbb{R}^3$ from the illumination matrix $\mathbf{S} = [\mathbf{s}_1, \dots, \mathbf{s}_L]^\top \in \mathbb{R}^{L \times 3}$ and intensity vector $\mathbf{i} \in \mathbb{R}^L$. Standard Ordinary Least Squares (OLS) minimizes $\|\mathbf{S}\mathbf{g} - \mathbf{i}\|_2^2$, which is heavily biased by cast shadows. Instead, we execute $M = 6$ iterations of Iteratively Reweighted Least Squares (IRLS):
+\begin{equation}
+    \mathbf{g}^{(m+1)} = \left(\mathbf{S}^\top \mathbf{W}^{(m)} \mathbf{S} + 10^{-4}\mathbf{I}_3\right)^{-1} \mathbf{S}^\top \mathbf{W}^{(m)} \mathbf{i},
+\end{equation}
+where diagonal weight matrix $\mathbf{W}^{(m)} = \operatorname{diag}(w_1^{(m)}, \dots, w_L^{(m)})$ updates via Geman-McClure residual weights $w_k^{(m)} = (1 + (|i_k - \mathbf{s}_k^\top \mathbf{g}^{(m)}|/0.02)^2)^{-2}$ with explicit shadow suppression ($w_k = 0.005$ when $i_k < 0.025$). Unit normals are recovered from $\mathbf{g}$ by normalization, converted to surface gradients $p = -\hat{n}_x/\hat{n}_z$ and $q = -\hat{n}_y/\hat{n}_z$, and integrated into a 3D heightmap $\hat{Z}(x, y)$ in the frequency domain via the Frankot-Chellappa projection:
+\begin{equation}
+    \mathcal{F}\{\hat{Z}\}(\omega_x, \omega_y) = \frac{-j\omega_x \mathcal{F}\{p\}(\omega_x, \omega_y) - j\omega_y \mathcal{F}\{q\}(\omega_x, \omega_y)}{\omega_x^2 + \omega_y^2}.
+\end{equation}
+
+\section{Experimental Evaluation}
+
+\subsection{Evaluation Metrics}
+For multi-view LWIR volumetric reconstruction on a $44^3$ voxel grid ($2500$ ground-truth surface points), we evaluate:
+\begin{itemize}
+    \item \textbf{Volumetric IoU ($\uparrow$):} Intersection-over-Union between predicted and ground-truth boolean occupancy grids.
+    \item \textbf{Chamfer Distance ($\downarrow$):} Symmetric $L_1$ nearest-neighbor distance between extracted boundary surface points $\hat{\mathcal{P}}$ and ground-truth surface points $\mathcal{P}_{\text{gt}}$.
+    \item \textbf{F-Score@0.06 ($\uparrow$):} Harmonic mean of 3D surface precision and recall at distance threshold $\tau = 0.06$.
+\end{itemize}
+For active NIR photometric stereo, we report the \textbf{Height MAE ($\downarrow$)} on $\hat{Z}(x,y)$ and the \textbf{Normal Angular Error ($\downarrow$)} in degrees.
+
+\begin{table}[t]
+\centering
+\caption{Multi-View LWIR Thermal 3D Reconstruction Benchmark ($44^3$ Voxel Grid, 18 Views at $64\times 64$)}
+\label{tab:lwir_results}
+\footnotesize
+\setlength{\tabcolsep}{4.5pt}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Method} & \textbf{IoU ($\uparrow$)} & \textbf{CD ($\downarrow$)} & \textbf{F1@0.06 ($\uparrow$)} \\
+\midrule
+\multicolumn{4}{l}{\textit{Scenario A: Unoccluded ($N_{\text{occ}} = 0$, 0.0\% Occlusion)}} \\
+1a. Strict Space Carving & \textbf{0.887} & \textbf{0.0256} & \textbf{0.987} \\
+1b. Occlusion-Voting Carving & 0.614 & 0.0580 & 0.636 \\
+2. AOS Focal Stack \cite{schedl2020search} & 0.793 & 0.0298 & 0.940 \\
+3. Physics-Robust Field (Ours) & 0.841 & 0.0264 & 0.979 \\
+\midrule
+\multicolumn{4}{l}{\textit{Scenario B: Occluded ($N_{\text{occ}} = 6$ Pillars, 37.6\% Occlusion)}} \\
+1a. Strict Space Carving & 0.000 & $\infty$ & 0.000 \\
+1b. Occlusion-Voting Carving & 0.776 & 0.0332 & 0.888 \\
+2. AOS Focal Stack \cite{schedl2020search} & \textbf{0.793} & \textbf{0.0312} & \textbf{0.925} \\
+3. Physics-Robust Field (Ours) & 0.787 & 0.0486 & 0.851 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{Active NIR Photometric Stereo Benchmark Under Cast-Shadow Occlusions ($64\times 64$ Grid, $L=8$ Lights)}
+\label{tab:nir_results}
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Method} & \textbf{Height MAE ($\downarrow$)} & \textbf{Normal Error ($\downarrow$)} \\
+\midrule
+Standard Least Squares ($L_2$ OLS) & 0.0545 & $8.21^\circ$ \\
+Robust IRLS Photometric Stereo & \textbf{0.0162} & $\mathbf{0.60^\circ}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Results and Discussion}
+Table~\ref{tab:lwir_results} summarizes the multi-view LWIR benchmark across unoccluded and occluded scenarios. In the clean unoccluded setting (Scenario A), Strict Space Carving (Method 1a) achieves the highest volumetric IoU ($0.887$) and F-Score ($0.987$), closely followed by our Physics-Robust Thermal Field (Method 3) at $0.841$ IoU and $0.979$ F-Score. By contrast, fixed-threshold Occlusion-Voting Space Carving (Method 1b) over-inflates the visual hull when no occluders are present, reducing IoU to $0.614$.
+
+When six foreground occluder pillars are introduced (Scenario B, occluding $37.6\%$ of target pixels across views), Strict Space Carving suffers catastrophic failure ($\text{IoU} = 0.000$, zero surviving voxels) because every voxel on the target is blocked in at least one view. In contrast, AOS Thermal Focal Stacking (Method 2) maintains an identical volumetric IoU of $0.793$ across both unoccluded and occluded settings, achieving the best occluded Chamfer distance ($0.0312$) and F-Score ($0.925$). Our Physics-Informed Robust Thermal Radiance Field (Method 3) achieves strong performance across both regimes without manual re-tuning ($0.841$ unoccluded IoU and $0.787$ occluded IoU), demonstrating the effectiveness of combining Geman-McClure distractor gating with 3D conductive Laplacian regularization.
+
+Table~\ref{tab:nir_results} presents the active NIR photometric stereo benchmark under cast-shadow bar occlusions. Standard $L_2$ Ordinary Least Squares (OLS) suffers severe normal tilting toward occluded light directions, resulting in an $8.21^\circ$ mean angular error and $0.0545$ height MAE. Our 6-iteration IRLS estimator effectively rejects shadowed measurements, reducing the surface normal error by $92.7\%$ to $0.60^\circ$ and lowering the integrated 3D height MAE by $70.3\%$ to $0.0162$.
+
+\section{Conclusion}
+We presented a unified benchmark and algorithmic study for 3D object reconstruction from passive LWIR thermal and active NIR images under heavy occlusion. Our experiments confirm that classical visual-hull and $L_2$ photometric formulations break down in the presence of cold foreground obstacles and cast shadows, whereas synthetic-aperture trimming (AOS), physics-informed robust radiance optimization, and IRLS photometric stereo reliably recover accurate 3D surfaces. Future work includes extending the volumetric thermal field to continuous neural implicit surfaces and validating on real-world multi-view LWIR captures.
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}
