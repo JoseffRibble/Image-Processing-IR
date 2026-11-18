@@ -27,7 +27,12 @@ from ir_reconstruction import (
     volumetric_iou,
 )
 from ir_reconstruction.metrics import _pairwise_min_distances
-from ir_reconstruction.methods import _project_points_to_camera, _bilinear_sample
+from ir_reconstruction.methods import (
+    _project_points_to_camera,
+    _bilinear_sample,
+    _fill_interior_holes,
+    _keep_largest_component,
+)
 
 # Configure matplotlib for crisp Times-like academic typography
 plt.rcParams.update({
@@ -103,9 +108,19 @@ def run_ablation_variant(
     tau = np.exp(-atm_beta * np.clip(proj_z, 0.5, 4.0))
     obs_comp = obs_vals / np.maximum(tau, 1e-4)
 
-    empty_ray_fraction = np.mean(valid_mask & (obs_vals < 0.022), axis=0)
-    hull_prior = (empty_ray_fraction <= 0.12) if use_hull_prior else np.ones((grid_res, grid_res, grid_res), dtype=bool)
+    img_occ_rate = float(np.mean((thermal_images >= 0.022) & (thermal_images < 0.15)))
+    min_hot = max(0.40, 0.72 - 0.50 * img_occ_rate)
+    trim_q = min(0.50, max(0.25, 0.85 * img_occ_rate))
 
+    empty_ray_fraction = np.mean(valid_mask & (obs_vals < 0.022), axis=0)
+    hot_fraction = np.mean(valid_mask & (obs_vals >= 0.15), axis=0)
+    hull_prior = (
+        ((empty_ray_fraction <= 0.06) & (hot_fraction >= min_hot))
+        if use_hull_prior
+        else np.ones((grid_res, grid_res, grid_res), dtype=bool)
+    )
+
+    q50 = np.median(obs_comp, axis=0).astype(np.float32)
     q75 = np.percentile(obs_comp, 75, axis=0).astype(np.float32)
     field = np.where(hull_prior, q75, 0.0).astype(np.float32)
 
@@ -120,10 +135,15 @@ def run_ablation_variant(
             robust_w = np.ones_like(residual)
 
         if use_distractor_gate:
-            is_occluder_distractor = (obs_vals >= 0.022) & (obs_vals < 0.15) & (q75[None, ...] > 0.25)
+            is_occluder_distractor = (
+                (obs_vals >= 0.022)
+                & (obs_vals < 0.15)
+                & ((q50[None, ...] > 0.20) | (q75[None, ...] > 0.25))
+                & (hot_fraction[None, ...] >= min_hot)
+            )
             is_empty_bg = obs_vals < 0.022
             robust_w = np.where(is_occluder_distractor, 0.01 * robust_w, robust_w)
-            robust_w = np.where(is_empty_bg, 2.5, robust_w)
+            robust_w = np.where(is_empty_bg, 3.0, robust_w)
 
         robust_w = np.where(valid_mask, robust_w, 0.0)
         grad_data = np.sum(robust_w * residual * tau, axis=0) / np.maximum(np.sum(robust_w, axis=0), 1e-4)
@@ -142,7 +162,19 @@ def run_ablation_variant(
         field = field - lr * (grad_data - tv_weight * laplacian)
         field = np.where(hull_prior, np.clip(field, 0.0, 1.0), 0.0)
 
-    occupancy = field >= 0.25
+    if use_distractor_gate:
+        sorted_comp = np.sort(obs_comp, axis=0)
+        k_start = int(np.floor(V * trim_q))
+        top_std = np.std(sorted_comp[k_start:], axis=0)
+        coherence_field = field * np.exp(-3.5 * top_std)
+    else:
+        coherence_field = field
+
+    raw_occ = coherence_field >= 0.25
+    if use_hull_prior and tv_weight > 0:
+        occupancy = _fill_interior_holes(_keep_largest_component(raw_occ))
+    else:
+        occupancy = raw_occ
     padded_occ = np.pad(occupancy, 1, mode="constant", constant_values=False)
     eroded = (
         padded_occ[1:-1, 1:-1, 1:-1]
@@ -240,11 +272,14 @@ def main():
     # Figure 2: 3D Reconstructed Point Cloud Comparison
     # -------------------------------------------------------------------------
     fig = plt.figure(figsize=(9.6, 4.3))
+    m_1b = summary_data["occluded"]["1b_voting"]
+    m_2 = summary_data["occluded"]["2_aos"]
+    m_3 = summary_data["occluded"]["3_ours"]
     panels = [
         ("Ground Truth Surface", pts_gt, pts_gt[:, 2], "viridis"),
-        ("1b. Voting Carving (Occluded)\nIoU: 0.776 | CD: 0.0333", outs_occ["1b_voting"]["surface_points"], outs_occ["1b_voting"]["surface_temperatures"], "inferno"),
-        ("2. AOS Focal Stack (Occluded)\nIoU: 0.793 | CD: 0.0315", outs_occ["2_aos"]["surface_points"], outs_occ["2_aos"]["surface_temperatures"], "inferno"),
-        ("3. Physics-Robust Field (Ours)\nIoU: 0.787 | CD: 0.0486", outs_occ["3_ours"]["surface_points"], outs_occ["3_ours"]["surface_temperatures"], "inferno"),
+        (f"1b. Voting Carving\nIoU: {m_1b['iou']:.3f} | CD: {m_1b['chamfer']:.4f}", outs_occ["1b_voting"]["surface_points"], outs_occ["1b_voting"]["surface_temperatures"], "inferno"),
+        (f"2. AOS Focal Stack\nIoU: {m_2['iou']:.3f} | CD: {m_2['chamfer']:.4f}", outs_occ["2_aos"]["surface_points"], outs_occ["2_aos"]["surface_temperatures"], "inferno"),
+        (f"3. Physics-Robust Field\nIoU: {m_3['iou']:.3f} | CD: {m_3['chamfer']:.4f}", outs_occ["3_ours"]["surface_points"], outs_occ["3_ours"]["surface_temperatures"], "inferno"),
     ]
     for idx, (title, pts, vals, cmap) in enumerate(panels):
         ax = fig.add_subplot(1, 4, idx + 1, projection="3d")

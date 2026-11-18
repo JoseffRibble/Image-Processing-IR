@@ -306,6 +306,49 @@ def reconstruct_ir_photometric_stereo(
 # Method 4: Physics-Informed Robust Thermal Radiance Field (Thermal-NeRF / 3DGS style)
 # =============================================================================
 
+
+def _dilate_masked_6(seed: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Flood-fill 6-connected voxels in `mask` starting from `seed`."""
+    comp = seed.copy()
+    while True:
+        padded = np.pad(comp, 1, mode="constant", constant_values=False)
+        dil = (
+            comp
+            | padded[:-2, 1:-1, 1:-1]
+            | padded[2:, 1:-1, 1:-1]
+            | padded[1:-1, :-2, 1:-1]
+            | padded[1:-1, 2:, 1:-1]
+            | padded[1:-1, 1:-1, :-2]
+            | padded[1:-1, 1:-1, 2:]
+        ) & mask
+        if np.array_equal(dil, comp):
+            return comp
+        comp = dil
+
+
+def _keep_largest_component(occupancy: np.ndarray) -> np.ndarray:
+    """Retain the primary 6-connected object component nearest the occupied centroid."""
+    coords = np.argwhere(occupancy)
+    if len(coords) == 0:
+        return occupancy
+    center = coords.mean(axis=0)
+    seed_coord = coords[np.argmin(np.sum((coords - center) ** 2, axis=1))]
+    seed = np.zeros_like(occupancy)
+    seed[seed_coord[0], seed_coord[1], seed_coord[2]] = True
+    return _dilate_masked_6(seed, occupancy)
+
+
+def _fill_interior_holes(occupancy: np.ndarray) -> np.ndarray:
+    """Fill enclosed interior cavities via 6-connected exterior flood-fill from grid borders."""
+    exterior_seed = np.zeros_like(occupancy)
+    exterior_seed[0, :, :] = exterior_seed[-1, :, :] = True
+    exterior_seed[:, 0, :] = exterior_seed[:, -1, :] = True
+    exterior_seed[:, :, 0] = exterior_seed[:, :, -1] = True
+    exterior_seed &= ~occupancy
+    exterior = _dilate_masked_6(exterior_seed, ~occupancy)
+    return ~exterior
+
+
 def reconstruct_thermal_radiance_field(
     thermal_images: np.ndarray,
     cameras: List[CameraPose],
@@ -349,12 +392,18 @@ def reconstruct_thermal_radiance_field(
     tau = np.exp(-atm_beta * np.clip(proj_z, 0.5, 4.0))
     obs_comp = obs_vals / np.maximum(tau, 1e-4)
 
-    # Identify candidate visual hull where rays either see hot object OR cold occluder (val >= 0.022)
-    # Empty background rays (val < 0.022) strongly carve free space
+    # Estimate scene-level occluder fraction from observed images to adapt support thresholds
+    img_occ_rate = float(np.mean((thermal_images >= 0.022) & (thermal_images < 0.15)))
+    min_hot = max(0.40, 0.72 - 0.50 * img_occ_rate)
+    trim_q = min(0.50, max(0.25, 0.85 * img_occ_rate))
+
+    # Identify candidate visual hull: require minimal empty-background rays and hot support
     empty_ray_fraction = np.mean(valid_mask & (obs_vals < 0.022), axis=0)
-    hull_prior = empty_ray_fraction <= 0.12
+    hot_fraction = np.mean(valid_mask & (obs_vals >= 0.15), axis=0)
+    hull_prior = (empty_ray_fraction <= 0.06) & (hot_fraction >= min_hot)
 
     # Initialize thermal radiance field from upper-quartile consensus inside hull prior
+    q50 = np.median(obs_comp, axis=0).astype(np.float32)
     q75 = np.percentile(obs_comp, 75, axis=0).astype(np.float32)
     field = np.where(hull_prior, q75, 0.0).astype(np.float32)
 
@@ -367,13 +416,18 @@ def reconstruct_thermal_radiance_field(
         abs_res = np.abs(residual)
         robust_w = 1.0 / ((1.0 + (abs_res / robust_delta) ** 2) ** 2)
 
-        # RobustNeRF distractor gate: if a ray sees a cold occluder (0.022 <= obs < 0.15)
-        # while the 75th-percentile multi-view consensus is hot (> 0.25), downweight that ray
-        is_occluder_distractor = (obs_vals >= 0.022) & (obs_vals < 0.15) & (q75[None, ...] > 0.25)
+        # RobustNeRF distractor gate: only treat [0.022, 0.15) as an occluder distractor
+        # when unoccluded consensus is hot and sufficient hot rays support the voxel
+        is_occluder_distractor = (
+            (obs_vals >= 0.022)
+            & (obs_vals < 0.15)
+            & ((q50[None, ...] > 0.20) | (q75[None, ...] > 0.25))
+            & (hot_fraction[None, ...] >= min_hot)
+        )
         # Conversely, genuinely empty background rays (obs < 0.022) get high weight to carve free space
         is_empty_bg = obs_vals < 0.022
         robust_w = np.where(is_occluder_distractor, 0.01 * robust_w, robust_w)
-        robust_w = np.where(is_empty_bg, 2.5, robust_w)
+        robust_w = np.where(is_empty_bg, 3.0, robust_w)
         robust_w = np.where(valid_mask, robust_w, 0.0)
 
         grad_data = np.sum(robust_w * residual * tau, axis=0) / np.maximum(
@@ -396,7 +450,13 @@ def reconstruct_thermal_radiance_field(
         field = np.where(hull_prior, np.clip(field, 0.0, 1.0), 0.0)
         loss_history.append(float(np.mean(robust_w * (residual**2))))
 
-    occupancy = field >= 0.25
+    # Penalize high inter-view variance across the unoccluded upper views
+    sorted_comp = np.sort(obs_comp, axis=0)
+    k_start = int(np.floor(V * trim_q))
+    top_std = np.std(sorted_comp[k_start:], axis=0)
+    coherence_field = field * np.exp(-3.5 * top_std)
+
+    occupancy = _fill_interior_holes(_keep_largest_component(coherence_field >= 0.25))
     padded_occ = np.pad(occupancy, 1, mode="constant", constant_values=False)
     eroded = (
         padded_occ[1:-1, 1:-1, 1:-1]
